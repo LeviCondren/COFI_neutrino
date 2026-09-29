@@ -1,0 +1,8 @@
+# Run artifacts from submit_selfconsistent.sbatch / run_selfconsistent_checkpointed.jl
+checkpoints/
+checkpoints_*/
+logs/
+
+# Julia
+*.jl.cov
+*.jl.mem
