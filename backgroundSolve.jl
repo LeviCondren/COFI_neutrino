@@ -1,6 +1,7 @@
 module backgroundSolve
 
-export dirac_rhs!, solve_uv_solution, solve_ir_solution, plot_ir_solution, propagator_trace, renormalized_condensate,
+export dirac_rhs!, solve_uv_solution, solve_ir_solution, plot_ir_solution, propagator_trace, propagator_trace_direct, renormalized_condensate,
+       solve_uv_angle, solve_ir_angle,
        kleinGordon_rhs!, solve_uv_scalar_solution, solve_ir_scalar_solution, get_scalar_components,
        tabulate_condensate, solve_self_consistent_background
 

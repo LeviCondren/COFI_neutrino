@@ -2,30 +2,32 @@ using DifferentialEquations
 using Interpolations
 
 # ==================================================================
-# Klein-Gordon equation for the bulk scalar field phi(z), sourced by
-# the fermion condensate <psibar psi>(z):
+# Klein-Gordon equation for the bulk scalar background phi(z) (Euclidean,
+# zero boundary momentum), sourced by the fermion condensate <psibar psi>(z):
 #
-#   z^2 phi'' - 3 z phi' + (m_phi^2 + pE^2 z^2) phi = y5 * <psibar psi>(z)
+#   z^2 phi'' - 3 z phi' - m_phi^2 phi = y5 * <psibar psi>(z)
 #
+# Homogeneous solutions z^Δ± with Δ± = 2 ± sqrt(4 + m_phi^2).
 # Solved as a first-order system with state y = [phi, dphi/dz]:
 #
 #   dy[1] = dphi
-#   dy[2] = (3 z dphi - (m_phi^2 + pE^2 z^2) phi + y5 * source(z)) / z^2
+#   dy[2] = (3 z dphi + m_phi^2 phi + y5 * source(z)) / z^2
 #
-# m_phi and y5 are global constants (see backgroundSolve.jl); pE is the
-# momentum parameter, mirroring dirac_rhs!. `source_interp` is a fast
+# m_phi and y5 are global constants (see backgroundSolve.jl). The pE
+# argument of the solvers below is unused (kept so call sites don't change).
+# `source_interp` is a fast
 # interpolant standing in for the condensate <psibar psi>(z) - see
 # tabulate_condensate below for why it's precomputed rather than called
 # directly here.
 # ==================================================================
 
 function kleinGordon_rhs!(dy, y, params, z)
-    pE, source_interp = params
+    source_interp = params[1]
     phi, dphi = y[1], y[2]
 
-    # z^2 ddphi - 3 z dphi + (m_phi^2 + pE^2 z^2) phi - y5 * source_interp(z) = 0,
+    # z^2 ddphi - 3 z dphi - m_phi^2 phi - y5 * source_interp(z) = 0,
     # solved for ddphi = phi'':
-    ddphi = (3 * z * dphi - (m_phi^2 + pE^2 * z^2) * phi + y5 * source_interp(z)) / z^2
+    ddphi = (3 * z * dphi + m_phi^2 * phi + y5 * source_interp(z)) / z^2
 
     dy[1] = dphi    # d(phi)/dz
     dy[2] = ddphi   # d(dphi)/dz = phi''
@@ -47,7 +49,7 @@ the equation - see tabulate_condensate.
 function solve_uv_scalar_solution(pE, source_interp; reltol=1e-8, abstol=1e-10)
     y0 = [1.0, 0.0]
     zspan = (z0, z1)
-    params = (pE, source_interp)
+    params = (source_interp,)
 
     prob = ODEProblem(kleinGordon_rhs!, y0, zspan, params)
     sol = solve(prob, Vern9(),
@@ -67,7 +69,7 @@ Integrates BACKWARD from z1 to z0.
 function solve_ir_scalar_solution(pE, source_interp; reltol=1e-8, abstol=1e-10)
     y0 = [0.0, 1.0]
     zspan = (z1, z0)   # Backward integration
-    params = (pE, source_interp)
+    params = (source_interp,)
 
     prob = ODEProblem(kleinGordon_rhs!, y0, zspan, params)
     sol = solve(prob, Vern9(),

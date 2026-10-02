@@ -19,7 +19,7 @@ function dirac_rhs!(dy, y, params, z)
     
     fL, fR = y[1], y[2]
     dy[1] = -M * fL + pE * fR
-    dy[2] =  M * fR - pE * fL
+    dy[2] =  M * fR + pE * fL
 end
 
 
@@ -86,4 +86,36 @@ function get_components(sol)
     fL = z -> (k*z)^2 * sol(z)[1]
     fR = z -> (k*z)^2 * sol(z)[2]
     return fL, fR
+end
+
+# ==================================================================
+# Overflow-free (Prüfer angle) form
+# ==================================================================
+
+"""
+Write (fL, fR) = r (cos θ, sin θ). The trace in propagator_trace depends only
+on the ratio fR/fL of each solution, i.e. on θ, and (Euclidean dirac_rhs!) θ obeys
+
+    dθ/dz = M(z) sin(2θ) + pE cos(2θ)
+
+which stays O(1) however large M gets - unlike fL, fR, which grow like
+exp(∫2M) or exp(pE Δz) and overflow Float64 (|phi| ~ 1e6, or pE >~ 8 at phi = 0).
+UV: (fL, fR)(z0) = (1, 0) -> θ(z0) = 0.  IR: (fL, fR)(z1) = (0, 1) -> θ(z1) = π/2.
+
+Large |M| makes this stiff, hence the auto-switching stiff solver.
+"""
+function dirac_angle_rhs(θ, params, z)
+    pE, phi_interp = params
+    M = (m_psi + y5 * phi_interp(z)) / (k * z)
+    return M * sin(2θ) + pE * cos(2θ)
+end
+
+function solve_uv_angle(pE, phi_interp; reltol=1e-10, abstol=1e-12)
+    prob = ODEProblem(dirac_angle_rhs, 0.0, (z0, z1), (pE, phi_interp))
+    return solve(prob, AutoVern9(Rodas5P()); reltol=reltol, abstol=abstol, dense=true)
+end
+
+function solve_ir_angle(pE, phi_interp; reltol=1e-10, abstol=1e-12)
+    prob = ODEProblem(dirac_angle_rhs, π/2, (z1, z0), (pE, phi_interp))
+    return solve(prob, AutoVern9(Rodas5P()); reltol=reltol, abstol=abstol, dense=true)
 end

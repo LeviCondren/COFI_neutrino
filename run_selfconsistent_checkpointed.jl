@@ -23,7 +23,7 @@
 # that whole class of bug.
 using Distributed
 
-const PROJECT_ROOT = "/global/u2/l/lcondren/COFI_neutrino"
+const PROJECT_ROOT = @__DIR__
 const N_WORKERS = parse(Int, get(ENV, "SC_NWORKERS", get(ENV, "SLURM_CPUS_PER_TASK", "4")))
 addprocs(N_WORKERS)
 
@@ -50,28 +50,49 @@ const P_MAX     = backgroundSolve.p_max
 const N_POINTS  = parse(Int, get(ENV, "SC_N_POINTS", "12"))
 const RTOL      = parse(Float64, get(ENV, "SC_RTOL", "1e-3"))
 const TOL       = parse(Float64, get(ENV, "SC_TOL", "1e-4"))
+# If > 0, converge on the RELATIVE change max|Δphi| / max|phi| < REL_TOL instead
+# of the absolute TOL (phi can reach ~1e7, making any absolute tolerance arbitrary).
+const REL_TOL   = parse(Float64, get(ENV, "SC_REL_TOL", "0"))
 const MAX_ITER  = parse(Int, get(ENV, "SC_MAX_ITER", "10"))
 const SAMPLE_ZS = range(backgroundSolve.z0, backgroundSolve.z1, length=5)
 const SAVE_GRID = backgroundSolve.z_grid  # 500 points z0:z1 - used to checkpoint phi_interp itself
+# Pass-0 profile: "homogeneous" = UV solve of the KG equation with the source off;
+# "ansatz" = power law A z^Δ- + B z^Δ+ (see power_law_ansatz).
+const INIT      = get(ENV, "SC_INIT", "homogeneous")
 
 # Wall-clock budget: leave a safety margin before SLURM's hard kill so we can
 # always finish writing whatever checkpoint is in progress. Must be set by
 # the sbatch script to match its own --time (see submit_selfconsistent.sbatch).
 #
-# This buffer must comfortably exceed the slowest single condensate point
-# (~9 min observed) since, unlike a threaded loop, a pmap batch of remaining
-# points is only checkpointed once the WHOLE batch returns, not point by
-# point - so the deadline check before launching a batch needs enough room
-# left for that whole batch (bounded by its slowest point) to finish.
+# No new condensate point is started after DEADLINE. Points are checkpointed
+# individually as they finish, so the buffer should exceed the slowest single
+# point (up to ~35 min observed on HPC3) for in-flight points to complete;
+# any that don't are simply recomputed by the next job.
 const WALL_SECONDS  = parse(Float64, get(ENV, "SBATCH_WALL_SECONDS", "14400"))
-const SAFETY_BUFFER = 900.0
+const SAFETY_BUFFER = parse(Float64, get(ENV, "SC_SAFETY_BUFFER", "900"))
 const START_TIME    = time()
 const DEADLINE       = START_TIME + WALL_SECONDS - SAFETY_BUFFER
 
 out_of_time() = time() > DEADLINE
 
+"""
+Homogeneous solution of the KG equation, z^2 phi'' - 3 z phi' - m_phi^2 phi = 0:
+phi = A z^Δ- + B z^Δ+ with Δ± = 2 ± sqrt(4 + m_phi^2), A and B fixed by the same
+UV conditions as solve_uv_scalar_solution, phi(z0) = 1 and phi'(z0) = 0.
+"""
+function power_law_ansatz()
+    m, z0 = backgroundSolve.m_phi, backgroundSolve.z0
+    dm, dp = 2 - sqrt(4 + m^2), 2 + sqrt(4 + m^2)
+    A, B = [z0^dm z0^dp; dm*z0^(dm-1) dp*z0^(dp-1)] \ [1.0, 0.0]
+    println("power-law ansatz: Δ- = $dm, Δ+ = $dp, A = $A, B = $B")
+    return z -> A * z^dm + B * z^dp
+end
+
 phi_checkpoint_path(iter)     = joinpath(CKPT_DIR, "phi_iter_$(iter).csv")
 partial_condensate_path(iter) = joinpath(CKPT_DIR, "condensate_partial_iter_$(iter).csv")
+# Complete, z-sorted source of iteration iter: phi_iter_iter is exactly the KG solve
+# sourced by the linear interpolant of these points (used by condensate_final.jl).
+condensate_path(iter)         = joinpath(CKPT_DIR, "condensate_iter_$(iter).csv")
 state_path()      = joinpath(CKPT_DIR, "state.txt")
 converged_path()  = joinpath(CKPT_DIR, "CONVERGED")
 maxiter_path()    = joinpath(CKPT_DIR, "MAX_ITER_REACHED")
@@ -139,16 +160,11 @@ Returns `nothing` if we ran out of wall-clock time before finishing all
 n_points - in that case, everything computed so far is already safely on
 disk for the next resubmission to pick up.
 
-Each remaining point is independent, so they run as one parallel batch
-across worker processes (Distributed.pmap) rather than one at a time.
-
-Wall-clock note: the deadline is only checked once, before launching a
-batch - a pmap batch blocks until ALL of its points finish before any of
-them are checkpointed (unlike a threaded loop, which could checkpoint each
-one as it individually completed). If the job is killed mid-batch, the
-whole batch's progress is lost, not just the unfinished points - this is
-why SAFETY_BUFFER is set well above the slowest single point's cost, so a
-batch launched just before the deadline still has room to finish.
+Each remaining point is independent. One task per worker process pulls
+points off a shared queue and ships each to its worker with remotecall_fetch;
+each result is appended to the partial file as soon as it returns, so a job
+killed mid-iteration (wall time or preemption) loses only its in-flight
+points. The deadline is checked before starting each point.
 """
 function tabulate_condensate_resumable(phi_interp, iter)
     zgrid = collect(range(backgroundSolve.z0, backgroundSolve.z1, length=N_POINTS))
@@ -169,22 +185,41 @@ function tabulate_condensate_resumable(phi_interp, iter)
 
         phi_zs = collect(SAVE_GRID)
         phi_vals = phi_interp.(phi_zs)
-        results = pmap(z -> compute_condensate_point(z, phi_zs, phi_vals, P_MAX, RTOL), remaining)
+        queue = Channel{Float64}(length(remaining))
+        foreach(z -> put!(queue, z), remaining)
+        close(queue)
 
+        # Master-side tasks are cooperatively scheduled on one thread, so the
+        # shared io/done updates between yield points don't race.
         io = open(partial_condensate_path(iter), "a")
         try
-            for (z, val) in zip(remaining, results)
-                println("  [iter $iter] z = ", z, "  <psibar psi> = ", val)
-                done[z] = val
-                println(io, z, ",", val)
-                flush(io)
+            @sync for w in workers()
+                @async for z in queue
+                    out_of_time() && break
+                    val = remotecall_fetch(compute_condensate_point, w, z, phi_zs, phi_vals, P_MAX, RTOL)
+                    done[z] = val
+                    println(io, z, ",", val); flush(io)
+                    println("  [iter $iter] z = ", z, "  <psibar psi> = ", val,
+                            "  (", length(done), "/", N_POINTS, ")"); flush(stdout)
+                end
             end
         finally
             close(io)
         end
+
+        if length(done) < N_POINTS
+            println("Out of wall-clock time; checkpointed ", length(done), "/", N_POINTS,
+                    " condensate points for iteration ", iter, ". Exiting for resubmission.")
+            return nothing
+        end
     end
 
     vals = [done[z] for z in zgrid]
+    atomic_write(condensate_path(iter)) do io
+        for (z, v) in zip(zgrid, vals)
+            println(io, z, ",", v)
+        end
+    end
     return linear_interpolation(zgrid, vals; extrapolation_bc=Line())
 end
 
@@ -209,9 +244,17 @@ function main()
 
     local phi_interp
     if last_iter === nothing
-        println("=== pass 0: homogeneous solve, source off ===")
-        phi_interp, _ = get_scalar_components(solve_uv_scalar_solution(PE, z -> 0.0))
-        save_phi_checkpoint(0, phi_interp)
+        if INIT == "ansatz"
+            println("=== pass 0: power-law ansatz ===")
+            phi0 = power_law_ansatz()
+        elseif INIT == "homogeneous"
+            println("=== pass 0: homogeneous solve, source off ===")
+            phi0, _ = get_scalar_components(solve_uv_scalar_solution(PE, z -> 0.0))
+        else
+            error("unknown SC_INIT = $INIT (expected \"homogeneous\" or \"ansatz\")")
+        end
+        save_phi_checkpoint(0, phi0)
+        phi_interp = load_phi_checkpoint(0)
         last_iter = 0
     else
         println("Resuming from checkpointed iteration ", last_iter)
@@ -228,15 +271,23 @@ function main()
         source_interp = tabulate_condensate_resumable(phi_interp, iter)
         source_interp === nothing && return  # already checkpointed per-point above
 
-        new_phi_interp, _ = get_scalar_components(solve_uv_scalar_solution(PE, source_interp))
+        new_phi, _ = get_scalar_components(solve_uv_scalar_solution(PE, source_interp))
+        save_phi_checkpoint(iter, new_phi)
+        # Compare checkpoint-to-checkpoint (both linear on SAVE_GRID). Comparing
+        # the raw ODE solution against a checkpoint-loaded phi instead measures
+        # linear-interpolation error, which is O(1) here since phi swings by
+        # hundreds per grid step - that spuriously blocked convergence after a resume.
+        new_phi_interp = load_phi_checkpoint(iter)
         max_diff = maximum(abs(new_phi_interp(z) - phi_interp(z)) for z in SAMPLE_ZS)
-        println("iteration ", iter, ": max change on sample = ", max_diff)
+        rel_diff = max_diff / maximum(abs, new_phi_interp.(SAVE_GRID))
+        println("iteration ", iter, ": max change on sample = ", max_diff,
+                "  (relative to max|phi|: ", rel_diff, ")"); flush(stdout)
+        converged = REL_TOL > 0 ? rel_diff < REL_TOL : max_diff < TOL
 
-        save_phi_checkpoint(iter, new_phi_interp)
         rm(partial_condensate_path(iter); force=true)  # iteration complete; drop its partial file
         phi_interp = new_phi_interp
 
-        if max_diff < TOL
+        if converged
             finish!(phi_interp, iter, converged_path(), "Converged after $iter iterations.")
             return
         end
